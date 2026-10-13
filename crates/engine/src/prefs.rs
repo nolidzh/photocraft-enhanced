@@ -937,11 +937,43 @@ pub struct Integrations {
     pub allow_agent_control: bool,
     /// Default control port (0 = only when `--control` is given).
     pub control_port: u32,
+    /// AI image-generation service credentials (OpenArt.ai, Higgsfield, …).
+    pub ai_services: AiServicesPrefs,
 }
 
 impl Default for Integrations {
     fn default() -> Self {
-        Self { allow_agent_control: true, control_port: 0 }
+        Self { allow_agent_control: true, control_port: 0, ai_services: AiServicesPrefs::default() }
+    }
+}
+
+/// Credentials configuration for each AI image-generation service.
+///
+/// For each service the user may either:
+/// 1. Set an environment variable (`OPENART_API_KEY`, `HIGGSFIELD_API_KEY`), or
+/// 2. Enter an API key directly in Edit › Preferences › Integrations, stored obfuscated.
+///
+/// Environment variables take priority by default (configurable per-service).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiServicesPrefs {
+    pub openart: AiServiceCredPrefs,
+    pub higgsfield: AiServiceCredPrefs,
+}
+
+/// Credential preferences for one AI service.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiServiceCredPrefs {
+    /// Check the environment variable before the stored key. Default: true.
+    pub use_env_var: bool,
+    /// Obfuscated (XOR + base64) API key. Empty = not set.
+    pub stored_key: String,
+}
+
+impl Default for AiServiceCredPrefs {
+    fn default() -> Self {
+        Self { use_env_var: true, stored_key: String::new() }
     }
 }
 

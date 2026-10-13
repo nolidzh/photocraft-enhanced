@@ -23,6 +23,9 @@
 //! * Affinity documents (`.af`, `.afdesign`, `.afphoto`, `.afpub`) open natively
 //!   with no source save path, what isn't imported listed in the warnings; a file
 //!   whose native data can't be read opens as its embedded preview; see `affinity`.
+//! * PaintShop Pro (`.pspimage`, `.psp`, `.pspframe`, `.psptube`, `.pspwarp`) open with their
+//!   raster layers, groups, blend modes, opacity and visibility (import only); vector, text and
+//!   tube layers are rasterised; see `psp`.
 //! * Every other format goes through `photocraft-codecs` as a single layer
 //!   (depth and Gray/RGB/CMYK model preserved): a locked "Background" when the
 //!   image is opaque, a normal "Layer 0" when it has transparency.
@@ -53,6 +56,7 @@ pub use ora::losses as ora_losses;
 pub mod pattern_map;
 mod pdn;
 pub mod pixels;
+mod psp;
 mod psd_export;
 mod psd_import;
 pub mod psd_thumbnail;
@@ -84,6 +88,9 @@ pub enum IoError {
     /// Paint.NET document decode failure.
     #[error("PDN: {0}")]
     Pdn(String),
+    /// PaintShop Pro document decode failure.
+    #[error("PSP: {0}")]
+    Psp(String),
     /// Krita document read failure.
     #[error("Krita: {0}")]
     Kra(String),
@@ -297,6 +304,15 @@ fn import_stages(name: &str, bytes: &[u8], ctl: &photocraft_raster::Interrupt, m
     }
     if has_extension(name, "pdn") || bytes.starts_with(b"PDN3") {
         return pdn::import(name, bytes, ctl);
+    }
+    if psp::is_psp(bytes)
+        || has_extension(name, "pspimage")
+        || has_extension(name, "psp")
+        || has_extension(name, "pspframe")
+        || has_extension(name, "psptube")
+        || has_extension(name, "pspwarp")
+    {
+        return psp::import(name, bytes, ctl);
     }
     if raw::is_raw(bytes) {
         return raw::import_raw(name, bytes);

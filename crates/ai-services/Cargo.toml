@@ -1,0 +1,30 @@
+[package]
+name = "photocraft-ai-services"
+description = "AI image-generation service adapters for PhotoCraft (OpenArt.ai, Higgsfield, …)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# This crate is desktop-only: HTTP calls don't make sense from WASM, and the engine exposes
+# the commands only when the feature is compiled in.  The wasm build doesn't depend on this
+# crate at all (it is not in default-members for the wasm target), so no cfg guards are needed
+# here — but `cfg(not(target_arch = "wasm32"))` guards remain on any networking code.
+
+[dependencies]
+photocraft-doc  = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-color = { workspace = true }
+photocraft-codecs = { workspace = true }
+photocraft-geom  = { workspace = true }
+thiserror        = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+log              = { workspace = true }
+
+# Sync HTTP client — no async runtime needed.  rustls for cross-platform TLS.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
