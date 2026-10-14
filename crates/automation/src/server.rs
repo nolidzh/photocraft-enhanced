@@ -14,6 +14,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::bridge::BridgeClient;
+#[allow(unused_imports)]
+use reqwest;
 use crate::budgets::{BatchReplyBudget, MAX_PREVIEW_SIDE, check_png, json_bytes};
 use crate::headless::Headless;
 use crate::security::MAX_BATCH_STEPS;
@@ -337,6 +339,34 @@ pub struct ControlParams {
     pub params: Option<Value>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiGenerateParams {
+    /// Text prompt for the image to generate.
+    pub prompt: String,
+    /// Which service to use (default: "openart").
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Model id (service-specific); omit for the service default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Output width in pixels (default: document width, clamped 64–4096).
+    #[serde(default)]
+    pub width: Option<u32>,
+    /// Output height in pixels (default: document height, clamped 64–4096).
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Number of images to generate (1–4, default 1).
+    #[serde(default)]
+    pub count: Option<u32>,
+    /// Guidance scale (0.0–1.0, default 0.7).
+    #[serde(default)]
+    pub guidance: Option<f64>,
+    /// Negative prompt (things to avoid in the image).
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -442,6 +472,10 @@ fn to_result(r: Result<Value, AutomationError>) -> Result<CallToolResult, McpErr
         Ok(v) => ok_json(&v),
         Err(e) => fail(e),
     })
+}
+
+fn to_text(v: Value) -> CallToolResult {
+    ok_json(&v)
 }
 
 fn bridge_only(name: &str) -> Result<CallToolResult, McpError> {
@@ -955,6 +989,97 @@ impl PhotocraftMcp {
             None => bridge_only("control_call"),
         }
     }
+
+    /// Generate an image via OpenArt.ai MCP and place it as a new layer.
+    ///
+    /// Flow:
+    ///   1. `ai.generate` → reserves a placeholder layer, returns `{layerId, …}`
+    ///   2. Calls the OpenArt MCP `openart_generate_image` tool
+    ///   3. Fetches the PNG from the returned URL
+    ///   4. `ai.layer.fulfil` → writes the pixels into the placeholder layer
+    #[tool(description = "Generate an image with OpenArt.ai and place it as a new raster layer in the active document. \
+        Returns the layer id and generation metadata. Requires an OpenArt API key configured via `ai.credentials.set` \
+        or the `OPENART_API_KEY` environment variable.")]
+    async fn ai_generate(&self, Parameters(p): Parameters<AiGenerateParams>) -> Result<CallToolResult, McpError> {
+        // 1. Reserve placeholder layer(s) in the document.
+        let reserve_params = json!({
+            "service": p.service.as_deref().unwrap_or("openart"),
+            "prompt": p.prompt,
+            "width": p.width.unwrap_or(1024),
+            "height": p.height.unwrap_or(1024),
+            "count": p.count.unwrap_or(1),
+            "model": p.model.as_deref().unwrap_or(""),
+            "guidance": p.guidance.unwrap_or(0.7),
+            "negativePrompt": p.negative_prompt.as_deref().unwrap_or(""),
+        });
+        let reservation = match self.run_command("ai.generate".into(), reserve_params, true).await {
+            Ok(r) if r.is_error != Some(true) => {
+                let text = r.content.first()
+                    .and_then(|c| c.as_text())
+                    .map(|t| t.text.as_str())
+                    .unwrap_or("{}");
+                match serde_json::from_str::<Value>(text) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(fail(format!("ai.generate parse error: {e}"))),
+                }
+            }
+            Ok(r) => return Ok(r),
+            Err(e) => return Err(e),
+        };
+
+        let layer_ids: Vec<u64> = reservation["layers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+            .unwrap_or_default();
+
+        if layer_ids.is_empty() {
+            return Ok(fail("ai.generate returned no layer ids"));
+        }
+
+        // 2. Call OpenArt MCP to generate the image.
+        // We only take the first layer id here (count=1 is the common case;
+        // multi-image requests are supported but require multiple OpenArt calls).
+        let count = p.count.unwrap_or(1).clamp(1, 4);
+        let mut fulfilled: Vec<Value> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for (i, &layer_id) in layer_ids.iter().enumerate() {
+            if i >= count as usize { break; }
+
+            let openart_result = self
+                .call_openart_generate(&p.prompt, p.model.as_deref(), p.width, p.height, p.guidance)
+                .await;
+
+            match openart_result {
+                Ok(png_bytes) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+                    let fulfil_result = self
+                        .run_command("ai.layer.fulfil".into(), json!({"layerId": layer_id, "pngBase64": b64}), true)
+                        .await;
+                    match fulfil_result {
+                        Ok(r) if r.is_error != Some(true) => {
+                            fulfilled.push(json!({"layerId": layer_id, "ok": true}));
+                        }
+                        Ok(r) => {
+                            let msg = r.content.first().and_then(|c| c.as_text()).map(|t| t.text.clone()).unwrap_or_default();
+                            errors.push(format!("layer {layer_id}: fulfil failed: {msg}"));
+                        }
+                        Err(e) => errors.push(format!("layer {layer_id}: {e:?}")),
+                    }
+                }
+                Err(e) => errors.push(format!("layer {layer_id}: generation failed: {e}")),
+            }
+        }
+
+        let result = json!({
+            "prompt": p.prompt,
+            "service": p.service.as_deref().unwrap_or("openart"),
+            "fulfilled": fulfilled,
+            "errors": errors,
+            "requestId": reservation["requestId"],
+        });
+        Ok(to_text(result))
+    }
 }
 
 fn bridge_only_headless(name: &str) -> Result<CallToolResult, McpError> {
@@ -962,6 +1087,118 @@ fn bridge_only_headless(name: &str) -> Result<CallToolResult, McpError> {
 }
 
 impl PhotocraftMcp {
+    /// Call the OpenArt MCP tool `openart_generate_image` and return the raw PNG bytes.
+    ///
+    /// This method uses `reqwest` (available in automation via the tokio runtime) to
+    /// fetch the image URL returned by the OpenArt MCP tool.  The MCP tool itself is
+    /// accessed through the rmcp client that the caller already holds — but since the
+    /// automation crate is the MCP *server*, not a client, we instead call the
+    /// `openart_generate_image` JSON function directly via the OpenArt REST endpoint
+    /// that the MCP tool wraps.  The API key is read from the engine session's prefs
+    /// or the `OPENART_API_KEY` environment variable.
+    async fn call_openart_generate(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+        guidance: Option<f64>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        // Resolve API key from env or stored prefs.
+        let api_key = std::env::var("OPENART_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| {
+                // Try stored key from engine session prefs.
+                let key_b64 = self
+                    .headless_op_sync(|h| {
+                        Ok(h.session.prefs().integrations.ai_services.openart.stored_key.clone())
+                    })
+                    .unwrap_or_default();
+                if key_b64.is_empty() {
+                    return None;
+                }
+                // Decode stored (XOR-obfuscated) key.
+                let host = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "photocraft".into());
+                let salt: Vec<u8> = if host.is_empty() { b"photocraft".to_vec() } else { host.into_bytes() };
+                let decoded = base64::engine::general_purpose::STANDARD.decode(&key_b64).ok()?;
+                let plain: Vec<u8> = decoded.iter().enumerate().map(|(i, b)| b ^ salt[i % salt.len()]).collect();
+                String::from_utf8(plain).ok()
+            })
+            .ok_or_else(|| "OpenArt API key not configured; use ai.credentials.set or set OPENART_API_KEY".to_string())?;
+
+        let w = width.unwrap_or(1024);
+        let h = height.unwrap_or(1024);
+        let model_str = model.filter(|s| !s.is_empty()).unwrap_or("dall-e-3");
+
+        // Call the OpenArt generation REST endpoint (same one the MCP tool uses).
+        let body = serde_json::json!({
+            "model": model_str,
+            "prompt": prompt,
+            "num_images": 1,
+            "width": w,
+            "height": h,
+            "guidance_scale": guidance.unwrap_or(7.0) * 10.0, // OpenArt uses 1-20 scale
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post("https://openart.ai/api/open/image/create")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("OpenArt request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("OpenArt API error {status}: {text}"));
+        }
+
+        let json_body: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("OpenArt response parse error: {e}"))?;
+
+        let image_url = json_body
+            .get("images")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|img| img.get("url").or_else(|| img.get("image_url")))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("OpenArt response missing image URL: {json_body}"))?;
+
+        // Fetch PNG bytes from the returned URL.
+        let png_bytes = client
+            .get(image_url)
+            .send()
+            .await
+            .map_err(|e| format!("image fetch failed: {e}"))?
+            .bytes()
+            .await
+            .map_err(|e| format!("image read failed: {e}"))?
+            .to_vec();
+
+        Ok(png_bytes)
+    }
+
+    /// Sync helper to read from the headless session without going async.
+    fn headless_op_sync<T>(
+        &self,
+        f: impl FnOnce(&mut Headless) -> std::result::Result<T, AutomationError>,
+    ) -> Option<T> {
+        if let Backend::Headless(ref h) = *self.backend {
+            let mut guard = h.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut guard).ok()
+        } else {
+            None
+        }
+    }
+
     async fn run_command(&self, id: String, params: Value, wait: bool) -> Result<CallToolResult, McpError> {
         let (id2, params2) = (id.clone(), params.clone());
         if let Some(r) = self.headless_op(move |h| h.command_start(&id2, params2, wait)).await {
